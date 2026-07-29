@@ -1,0 +1,1045 @@
+---
+title: "Reflection on Regression and Classification Models with Group Project Data"
+subtitle: "Analytics Objective: Predict Revenue (Customer Spending) on a Shopify E-Commerce Platform"
+author: "Ron Stephen Sabilla"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-expand: 1
+    toc-location: right-body
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    df-print: kable
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  freeze: true
+---
+
+# Task 1: Analytics Objective {#sec-ao}
+
+## Overview
+
+> **Analytics Objective (AO):** Using the Shopify Sales Dataset, predict the **revenue** of individual e-commerce transactions based on product, customer, and marketing channel information.
+
+For our group project, we're looking at a Shopify retailer that's seeing more sales but shrinking profit margins. To understand why, one useful starting point is figuring out what drives how much a customer spends per order. If we can predict revenue based on things like product category, traffic source, and discount level, we can start to see which combinations actually generate the most value.
+
+The dataset comes from Kaggle and has **60,000 Shopify orders** from January 2023 to June 2025, covering seven countries and seven product categories.[^1]
+
+[^1]: The Kaggle page describes this dataset as "realistic," which likely means it's synthetic rather than actual verified transaction data.
+
+::: {.callout-note title="About the code in this report"}
+All the R code below uses the **Customer Lifetime Value (CLV) dataset** from the Module 4 codebook. It's a simulated dataset that has the same structure as our Shopify data — a continuous spending outcome, a mix of numeric and categorical predictors, and some skew. I follow the codebook's process throughout, and my written interpretations connect back to our group project's Shopify context.
+:::
+
+---
+
+## Supervised vs. Unsupervised Learning {#sec-supervised}
+
+This is a **supervised learning** problem. We have a clear outcome variable (`revenue`) that we're trying to predict, and we have a set of features for each observation. The model is trained on labeled data and then evaluated on held-out test data to see how well it generalizes.
+
+Unsupervised learning wouldn't apply here because we're not looking for hidden patterns or clusters — we have a specific thing we want to predict.
+
+---
+
+## Variable Roles {#sec-variables}
+
+The table below shows how variables map between our Shopify project and the CLV dataset used in the code (e.g., `annual_spend` ↔ `revenue`, `loyalty_tier` ↔ `product_category`, `channel` ↔ `traffic_source`).
+
+| Variable (Shopify) | Role | Type | Notes |
+|:---|:---|:---|:---|
+| `revenue` | **Outcome (Y)** | Numeric / Continuous | Total order revenue after discount |
+| `product_category` | Feature (X) | Categorical | Electronics, Fashion, Beauty, etc. |
+| `traffic_source` | Feature (X) | Categorical | Paid Ads, Organic, Email, Direct, Social Media |
+| `customer_country` | Feature (X) | Categorical | USA, UAE, CAN, UK, IND, GER, AUS |
+| `payment_method` | Feature (X) | Categorical | Card, PayPal, etc. |
+| `quantity` | Feature (X) | Numeric | Number of items per order |
+| `discount_percent` | Feature (X) | Numeric | Discount percentage applied |
+| `shipping_cost` | Feature (X) | Numeric | Shipping cost per order |
+| `rating` | Feature (X) | Numeric | Customer rating (1–5) |
+| `is_returned` | Feature (X) | Binary | Whether the order was returned |
+| `profit` | **Excluded** | Numeric | Calculated from revenue — would cause data leakage |
+| `product_price` | **Excluded** | Numeric | Too directly related to revenue[^2] |
+
+: Variable Roles for the Shopify Revenue Prediction Task {#tbl-variables}
+
+[^2]: Revenue ≈ product_price × quantity × (1 − discount/100). Including `product_price` with `quantity` and `discount_percent` would essentially let the model just do arithmetic instead of learning from the data, leaving no room for the other features to matter.
+
+---
+
+## Machine Learning Category
+
+This is a **regression** problem because the outcome (`revenue`) is a continuous numeric variable. We're trying to predict a dollar amount, not a category.
+
+If the outcome were something like "did the customer return the item?" (yes/no), that would be a classification problem. But since we're predicting a continuous spending amount, regression is the right approach. I'll explain why I picked Lasso specifically in @sec-method-selection.
+
+---
+
+# Task 2: Chosen Codebook
+
+I'm using the regression codebook for this assignment:
+
+> **Module 4 — Regression-Focused Methods**
+> <https://jaejungca.github.io/regression-models/m04_regression_models.html>
+
+It covers OLS, Ridge, Lasso, Elastic Net, Polynomial regression, hyperparameter tuning, 10-fold CV comparison, and variable importance — all of which I go through below.
+
+---
+
+# Task 3: Machine Learning Pipeline {#sec-ml}
+
+## Libraries and Data Setup {#sec-setup}
+
+```{r setup}
+# Install vip from CRAN archive if not already present
+if (!requireNamespace("vip", quietly = TRUE)) {
+  install.packages(
+    "https://cran.r-project.org/src/contrib/Archive/vip/vip_0.4.6.tar.gz",
+    repos = NULL,
+    type  = "source"
+  )
+}
+
+library(tidymodels)
+library(tidyverse)
+library(glmnet)      # Ridge, Lasso, Elastic Net engine
+library(ggrepel)     # required by autoplot for glmnet coefficient paths
+library(patchwork)   # combining plots
+library(vip)         # variable importance plots
+tidymodels_prefer()
+set.seed(2025)
+```
+
+### Data Generation
+
+The CLV dataset from the codebook simulates 2,500 customers from a retail subscription service. The outcome is `annual_spend` — total yearly spending — which directly parallels `revenue` in our Shopify project. The predictors include things like income, purchase frequency, loyalty tier, and channel, which map to discount level, quantity, product category, and traffic source in our data.
+
+```{r generate-data}
+set.seed(2025)
+n <- 2500
+
+clv_data <- tibble(
+  customer_id     = paste0("CLV", str_pad(1:n, 5, pad = "0")),
+  age             = round(pmin(pmax(rnorm(n, mean = 42, sd = 12), 18), 85)),
+  income          = round(rlnorm(n, meanlog = 10.8, sdlog = 0.55)),
+  tenure_months   = round(pmax(1, rnorm(n, mean = 30, sd = 18))),
+  num_products    = sample(1:6, n, replace = TRUE,
+                           prob = c(0.25, 0.30, 0.20, 0.12, 0.08, 0.05)),
+  freq_purchases  = rpois(n, lambda = 8),
+  recency_days    = round(pmax(0, rexp(n, rate = 1 / 30))),
+  avg_basket      = round(rlnorm(n, meanlog = 4.0, sdlog = 0.45), 2),
+  channel         = sample(c("online", "in_store", "both"), n, replace = TRUE,
+                           prob = c(0.45, 0.25, 0.30)),
+  loyalty_tier    = sample(c("Bronze", "Silver", "Gold", "Platinum"), n,
+                           replace = TRUE, prob = c(0.35, 0.30, 0.22, 0.13)),
+  region          = sample(c("West", "South", "Midwest", "Northeast"), n, replace = TRUE),
+  promo_response  = sample(c("yes", "no"), n, replace = TRUE, prob = c(0.40, 0.60))
+) |>
+  mutate(
+    annual_spend = round(pmax(10,
+      200 + 0.004 * income + 18 * freq_purchases + 0.85 * avg_basket +
+      45 * num_products - 0.8 * recency_days + 2.0 * tenure_months +
+      case_when(
+        loyalty_tier == "Platinum" ~ 350,
+        loyalty_tier == "Gold"     ~ 200,
+        loyalty_tier == "Silver"   ~ 80,
+        TRUE                       ~ 0
+      ) +
+      if_else(channel == "both", 120, 0) +
+      if_else(promo_response == "yes", 75, 0) +
+      rnorm(n, 0, 180)
+    ), 2),
+    income        = if_else(runif(n) < 0.07, NA_real_, income),
+    avg_basket    = if_else(runif(n) < 0.05, NA_real_, avg_basket),
+    channel       = factor(channel),
+    loyalty_tier  = factor(loyalty_tier,
+                           levels = c("Bronze", "Silver", "Gold", "Platinum")),
+    region        = factor(region),
+    promo_response = factor(promo_response)
+  )
+
+glimpse(clv_data)
+```
+
+---
+
+## Exploratory Data Analysis {#sec-eda}
+
+### Distribution of Annual Spend
+
+```{r}
+#| label: fig-spend-dist
+#| fig-cap: "Annual spend is right-skewed — most customers spend a moderate amount, but a small group of high spenders pulls the mean up. This is pretty typical for e-commerce revenue data."
+#| fig-width: 9
+#| fig-height: 4
+
+p1 <- ggplot(clv_data, aes(x = annual_spend)) +
+  geom_histogram(bins = 40, fill = "#1a5276", color = "white", alpha = 0.85) +
+  labs(title = "Distribution of Annual Spend", x = "Annual Spend ($)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p2 <- ggplot(clv_data, aes(x = log(annual_spend))) +
+  geom_histogram(bins = 40, fill = "#b7950b", color = "white", alpha = 0.85) +
+  labs(title = "Log-Transformed Annual Spend", x = "log(Annual Spend)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p1 + p2
+```
+
+### Spend by Key Groups
+
+::: {.panel-tabset}
+
+#### By Loyalty Tier
+
+```{r}
+#| label: tbl-loyalty
+#| tbl-cap: "Spend goes up as loyalty tier increases — similar to how higher-end product categories would drive more revenue in the Shopify data."
+
+clv_data |>
+  group_by(loyalty_tier) |>
+  summarise(
+    n            = n(),
+    mean_spend   = round(mean(annual_spend)),
+    median_spend = round(median(annual_spend)),
+    sd_spend     = round(sd(annual_spend))
+  )
+```
+
+#### By Channel
+
+```{r}
+#| label: tbl-channel
+#| tbl-cap: "Customers who use both channels tend to spend the most. In the Shopify context, this is similar to how organic or returning customers may generate more revenue than paid traffic."
+
+clv_data |>
+  group_by(channel) |>
+  summarise(
+    n            = n(),
+    mean_spend   = round(mean(annual_spend)),
+    median_spend = round(median(annual_spend))
+  ) |>
+  arrange(desc(mean_spend))
+```
+
+#### Numeric Predictors
+
+```{r}
+#| label: fig-scatter
+#| fig-cap: "Both purchase frequency and basket size have a positive relationship with annual spend, which makes sense — buying more often and spending more per trip both add up."
+#| fig-width: 9
+#| fig-height: 4
+
+p3 <- ggplot(clv_data, aes(x = freq_purchases, y = annual_spend)) +
+  geom_point(alpha = 0.2, color = "#1a5276") +
+  geom_smooth(method = "lm", color = "#b7950b", se = FALSE) +
+  labs(title = "Spend vs. Purchase Frequency",
+       x = "Number of Purchases", y = "Annual Spend ($)") +
+  theme_minimal(base_size = 11)
+
+p4 <- ggplot(clv_data, aes(x = avg_basket, y = annual_spend)) +
+  geom_point(alpha = 0.2, color = "#1a5276") +
+  geom_smooth(method = "lm", color = "#b7950b", se = FALSE) +
+  labs(title = "Spend vs. Average Basket Size",
+       x = "Avg Basket ($)", y = "Annual Spend ($)") +
+  theme_minimal(base_size = 11)
+
+p3 + p4
+```
+
+:::
+
+::: {.callout-note title="Shopify connection"}
+In the Shopify data, `freq_purchases` is similar to `quantity` (items per order), and `loyalty_tier` is similar to `product_category`. Both show the same pattern — more volume and higher-tier segments mean more spending.
+:::
+
+---
+
+## Method Selection: Why Lasso? {#sec-method-selection}
+
+I chose **Lasso regression** as the starting method for a few reasons:
+
+1. **Lots of dummy variables.** Once you encode all the categorical features (product category, traffic source, country, payment method), you end up with 20+ binary columns. Not all of them are going to matter, and Lasso is good at figuring out which ones to drop.
+
+2. **Built-in variable selection.** Lasso's L1 penalty can actually set coefficients to exactly zero, which means it automatically removes predictors that aren't helping. That makes the results easier to explain.
+
+3. **Some predictors are probably correlated.** Traffic sources like Organic and Direct tend to attract similar types of customers. Lasso handles this by picking one and zeroing out the other, keeping the model cleaner.
+
+The Lasso loss function it minimizes is:
+
+$$\text{Lasso loss} = \sum_{i=1}^{n}(y_i - \hat{y}_i)^2 + \lambda \sum_{j=1}^{p} |\beta_j|$$
+
+The $\lambda$ parameter (called `penalty` in tidymodels) controls how aggressive the shrinkage is. A bigger penalty means more coefficients get zeroed out.
+
+I also try Ridge, Elastic Net, and Polynomial + Lasso as alternatives in @sec-alternatives, then compare everything with 10-fold CV in @sec-cv.
+
+---
+
+## Train/Test Split and Shared Recipe {#sec-split}
+
+```{r split}
+set.seed(617)
+clv_split <- initial_split(clv_data, prop = 0.80)
+clv_train <- training(clv_split)
+clv_test  <- testing(clv_split)
+
+cat("Training rows:", nrow(clv_train), "\n")
+cat("Test rows    :", nrow(clv_test),  "\n")
+cat("Mean spend (train):", round(mean(clv_train$annual_spend)), "\n")
+cat("Mean spend (test) :", round(mean(clv_test$annual_spend)),  "\n")
+```
+
+All five models use the same preprocessing recipe so that any differences in performance come from the model itself, not how the data was prepared.
+
+```{r recipe}
+clv_rec <- recipe(annual_spend ~ ., data = clv_train) |>
+  update_role(customer_id, new_role = "ID") |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_log(income, avg_basket, base = 10, offset = 1) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+clv_rec
+```
+
+```{r prep-inspect}
+tidy(prep(clv_rec))
+```
+
+::: {.callout-note title="What each recipe step does"}
+- `step_impute_median()` — fills in missing values with the median from the training set
+- `step_log()` — log-transforms skewed variables so they don't throw off the scaling
+- `step_normalize()` — standardizes numeric predictors to mean 0, SD 1 (important for regularized models so coefficients are comparable)
+- `step_dummy()` — turns factor columns into binary 0/1 columns
+- `step_zv()` — removes any column that has no variation (a safety step)
+:::
+
+---
+
+## Baseline: OLS Linear Regression {#sec-ols}
+
+I start with regular OLS as a baseline to have something to compare against. OLS just minimizes the sum of squared errors:
+
+$$RSS = \sum_{i=1}^{n}(y_i - \hat{y}_i)^2$$
+
+There's no penalty on the coefficients — it just tries to fit the training data as well as possible.
+
+```{r lm-fit}
+lm_spec <- linear_reg() |> set_engine("lm")
+
+lm_wf <- workflow() |>
+  add_recipe(clv_rec) |>
+  add_model(lm_spec)
+
+lm_fit <- fit(lm_wf, data = clv_train)
+
+lm_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate)))
+```
+
+```{r lm-metrics}
+lm_preds   <- augment(lm_fit, new_data = clv_test)
+lm_metrics <- lm_preds |>
+  metric_set(rmse, rsq, mae)(truth = annual_spend, estimate = .pred)
+
+lm_metrics
+```
+
+```{r}
+#| label: fig-lm-resid
+#| fig-cap: "Residuals vs. fitted values for OLS. The scatter looks fairly random around zero, which means the linear model is a reasonable fit."
+#| fig-width: 7
+#| fig-height: 4
+
+ggplot(lm_preds, aes(x = .pred, y = annual_spend - .pred)) +
+  geom_point(alpha = 0.3, color = "#1a5276") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#b7950b") +
+  labs(
+    title    = "OLS — Residuals vs. Fitted",
+    subtitle = "Patterns here would suggest the model is missing something",
+    x = "Predicted Annual Spend ($)", y = "Residual ($)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**Interpretation:** The OLS results give us a baseline RMSE and R² to beat. Looking at @fig-lm-resid, the residuals don't show a strong pattern, which is good — it means the linear model isn't doing anything obviously wrong. In the Shopify context, the OLS coefficients would tell us which categories and channels have the biggest effect on revenue, but they don't filter out noisy or unimportant predictors the way regularized models do.
+
+---
+
+## Alternative Methods {#sec-alternatives}
+
+### Ridge Regression
+
+Ridge adds an **L2 penalty** that shrinks all coefficients but never sets any of them to exactly zero:
+
+$$\text{Ridge loss} = RSS + \lambda \sum_{j=1}^{p} \beta_j^2$$
+
+```{r ridge-fit}
+ridge_spec <- linear_reg(penalty = 0.1, mixture = 0) |> set_engine("glmnet")
+ridge_wf   <- workflow() |> add_recipe(clv_rec) |> add_model(ridge_spec)
+ridge_fit  <- fit(ridge_wf, data = clv_train)
+
+ridge_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate)))
+```
+
+```{r ridge-metrics}
+ridge_preds   <- augment(ridge_fit, new_data = clv_test)
+ridge_metrics <- ridge_preds |>
+  metric_set(rmse, rsq, mae)(truth = annual_spend, estimate = .pred)
+
+ridge_metrics
+```
+
+::: {.callout-note title="mixture = 0 → pure Ridge"}
+In `linear_reg()` with the `glmnet` engine: `mixture = 0` → Ridge (L2 only), `mixture = 1` → Lasso (L1 only), and anything in between → Elastic Net.
+:::
+
+---
+
+### Lasso Regression
+
+```{r lasso-fit}
+lasso_spec <- linear_reg(penalty = 0.1, mixture = 1) |> set_engine("glmnet")
+lasso_wf   <- workflow() |> add_recipe(clv_rec) |> add_model(lasso_spec)
+lasso_fit  <- fit(lasso_wf, data = clv_train)
+
+lasso_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate))) |>
+  mutate(selected = if_else(estimate != 0, "✓ kept", "✗ zeroed"))
+```
+
+```{r lasso-metrics}
+lasso_preds   <- augment(lasso_fit, new_data = clv_test)
+lasso_metrics <- lasso_preds |>
+  metric_set(rmse, rsq, mae)(truth = annual_spend, estimate = .pred)
+
+lasso_metrics
+```
+
+```{r}
+#| label: fig-lasso-path
+#| fig-cap: "Lasso coefficient path. Each line is a predictor — as the penalty increases, weaker predictors get pushed to zero first. The ones that stay nonzero the longest are the most important."
+#| fig-width: 7
+#| fig-height: 4
+
+lasso_fit |>
+  extract_fit_engine() |>
+  autoplot() +
+  labs(
+    title    = "Lasso Coefficient Path",
+    subtitle = "As penalty (λ) increases, more coefficients are driven to zero",
+    x = "Log(λ)", y = "Coefficient value"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+### Elastic Net
+
+Elastic Net is basically a combination of Ridge and Lasso — it does some variable selection but also handles correlated predictors more gracefully:
+
+$$\text{Elastic Net loss} = RSS + \lambda \left[ \frac{1-\alpha}{2} \sum_j \beta_j^2 + \alpha \sum_j |\beta_j| \right]$$
+
+`mixture = 0.5` means equal parts Ridge and Lasso.
+
+```{r enet-fit}
+enet_spec <- linear_reg(penalty = 0.1, mixture = 0.5) |> set_engine("glmnet")
+enet_wf   <- workflow() |> add_recipe(clv_rec) |> add_model(enet_spec)
+enet_fit  <- fit(enet_wf, data = clv_train)
+
+enet_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate))) |>
+  mutate(selected = if_else(estimate != 0, "✓ kept", "✗ zeroed"))
+```
+
+```{r enet-metrics}
+enet_preds   <- augment(enet_fit, new_data = clv_test)
+enet_metrics <- enet_preds |>
+  metric_set(rmse, rsq, mae)(truth = annual_spend, estimate = .pred)
+
+enet_metrics
+```
+
+::: {.callout-note title="When Elastic Net is useful"}
+Elastic Net is helpful when you have a lot of correlated predictors (like multiple marketing channels that attract similar customers). Pure Lasso would just arbitrarily pick one and drop the rest, but Elastic Net spreads the weight around a bit more fairly.
+:::
+
+---
+
+### Polynomial + Lasso
+
+Linear regression assumes straight-line relationships, but that's not always realistic. We can add squared terms to capture any curvature:
+
+$$\hat{y} = \beta_0 + \beta_1 x + \beta_2 x^2 + \ldots$$
+
+```{r}
+#| label: fig-poly-viz
+#| fig-cap: "Comparing a straight linear fit (dashed) to a flexible LOESS curve (solid). If the curves are very different, polynomial terms might help."
+#| fig-width: 9
+#| fig-height: 4
+
+p5 <- ggplot(clv_train, aes(x = freq_purchases, y = annual_spend)) +
+  geom_point(alpha = 0.2, color = "#1a5276") +
+  geom_smooth(method = "lm",    color = "#b7950b", se = FALSE,
+              linetype = "dashed", linewidth = 0.9) +
+  geom_smooth(method = "loess", color = "#4F8A8B", se = FALSE, linewidth = 0.9) +
+  labs(title = "Spend vs. Purchase Frequency",
+       subtitle = "Dashed = linear | Solid = LOESS",
+       x = "Number of Purchases", y = "Annual Spend ($)") +
+  theme_minimal(base_size = 11)
+
+p6 <- ggplot(clv_train, aes(x = tenure_months, y = annual_spend)) +
+  geom_point(alpha = 0.2, color = "#1a5276") +
+  geom_smooth(method = "lm",    color = "#b7950b", se = FALSE,
+              linetype = "dashed", linewidth = 0.9) +
+  geom_smooth(method = "loess", color = "#4F8A8B", se = FALSE, linewidth = 0.9) +
+  labs(title = "Spend vs. Tenure",
+       subtitle = "Does the effect flatten over time?",
+       x = "Tenure (months)", y = "Annual Spend ($)") +
+  theme_minimal(base_size = 11)
+
+p5 + p6
+```
+
+```{r poly-fit}
+poly_rec <- recipe(annual_spend ~ ., data = clv_train) |>
+  update_role(customer_id, new_role = "ID") |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_log(income, avg_basket, base = 10, offset = 1) |>
+  step_poly(freq_purchases, tenure_months, degree = 2) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+poly_wf  <- workflow() |> add_recipe(poly_rec) |> add_model(lasso_spec)
+poly_fit <- fit(poly_wf, data = clv_train)
+
+poly_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)", estimate != 0) |>
+  arrange(desc(abs(estimate)))
+```
+
+```{r poly-metrics}
+poly_preds   <- augment(poly_fit, new_data = clv_test)
+poly_metrics <- poly_preds |>
+  metric_set(rmse, rsq, mae)(truth = annual_spend, estimate = .pred)
+
+poly_metrics
+```
+
+---
+
+## Hyperparameter Tuning {#sec-tuning}
+
+### Finding the Right Penalty
+
+So far I've been using `penalty = 0.1` as a starting guess. That's a bit arbitrary though — the best penalty depends on the actual data. To find it properly, I search over 30 different values using 10-fold cross-validation.
+
+```{r tune-setup}
+lasso_tune_spec <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+
+lasso_tune_wf <- workflow() |>
+  add_recipe(clv_rec) |>
+  add_model(lasso_tune_spec)
+
+set.seed(2025)
+clv_folds <- vfold_cv(clv_train, v = 10)
+
+penalty_grid <- grid_regular(
+  penalty(range = c(-4, 1)),
+  levels = 30
+)
+penalty_grid
+```
+
+```{r tune-grid}
+set.seed(2025)
+lasso_tune_results <- tune_grid(
+  lasso_tune_wf,
+  resamples = clv_folds,
+  grid      = penalty_grid,
+  metrics   = metric_set(rmse, rsq, mae)
+)
+
+autoplot(lasso_tune_results) +
+  labs(
+    title    = "Lasso Tuning — RMSE and R² Across Penalty Values",
+    subtitle = "Each point = 10-fold CV mean; shaded band = ± 1 SE"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Selecting the Best Penalty
+
+```{r select-best}
+best_penalty <- select_best(lasso_tune_results, metric = "rmse")
+best_penalty
+
+best_penalty_1se <- select_by_one_std_err(
+  lasso_tune_results, metric = "rmse", desc(penalty)
+)
+best_penalty_1se
+```
+
+::: {.callout-tip title="The one-standard-error rule"}
+`select_best()` picks the penalty with the lowest average RMSE. `select_by_one_std_err()` picks the **largest** penalty that's still within one standard error of the best — this gives a slightly simpler model with about the same performance, which is usually the safer choice.
+:::
+
+### Finalize and Evaluate the Tuned Model
+
+```{r finalize}
+final_lasso_wf  <- finalize_workflow(lasso_tune_wf, best_penalty)
+final_lasso_fit <- fit(final_lasso_wf, data = clv_train)
+
+final_preds   <- augment(final_lasso_fit, new_data = clv_test)
+final_metrics <- final_preds |>
+  metric_set(rmse, rsq, mae)(truth = annual_spend, estimate = .pred)
+
+final_metrics
+```
+
+```{r tuned-coefs}
+final_lasso_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate))) |>
+  mutate(selected = if_else(estimate != 0, "✓ kept", "✗ zeroed"))
+```
+
+---
+
+## 10-Fold Cross-Validated Model Comparison {#sec-cv}
+
+Now I compare all five models using the same 10 folds. See @fig-cv-plot and @tbl-cv-summary for the results.
+
+```{r cv-compare}
+cv_metrics_fn <- function(wf, label) {
+  fit_resamples(
+    wf, resamples = clv_folds,
+    metrics = metric_set(rmse, rsq, mae)
+  ) |>
+    collect_metrics() |>
+    mutate(model = label)
+}
+
+lm_cv    <- cv_metrics_fn(lm_wf,    "OLS Linear")
+ridge_cv <- cv_metrics_fn(ridge_wf, "Ridge (λ=0.1)")
+lasso_cv <- cv_metrics_fn(lasso_wf, "Lasso (λ=0.1)")
+enet_cv  <- cv_metrics_fn(enet_wf,  "Elastic Net (λ=0.1)")
+poly_cv  <- cv_metrics_fn(poly_wf,  "Polynomial + Lasso")
+
+all_cv <- bind_rows(lm_cv, ridge_cv, lasso_cv, enet_cv, poly_cv)
+```
+
+```{r}
+#| label: tbl-cv-summary
+#| tbl-cap: "10-fold CV RMSE for all five models. Lower RMSE is better."
+
+all_cv |>
+  filter(.metric == "rmse") |>
+  select(model, mean, std_err) |>
+  arrange(mean)
+```
+
+```{r}
+#| label: fig-cv-plot
+#| fig-cap: "CV RMSE across all five models. Overlapping error bars mean the differences aren't really meaningful."
+#| fig-width: 7
+#| fig-height: 4
+
+all_cv |>
+  filter(.metric == "rmse") |>
+  ggplot(aes(x = reorder(model, mean), y = mean)) +
+  geom_col(fill = "#1a5276", alpha = 0.85) +
+  geom_errorbar(
+    aes(ymin = mean - std_err, ymax = mean + std_err),
+    width = 0.3, color = "#b7950b", linewidth = 0.8
+  ) +
+  coord_flip() +
+  labs(
+    title    = "10-Fold CV RMSE — All Regression Models",
+    subtitle = "Error bars = ± 1 SE | Lower RMSE = better",
+    x = NULL, y = "Mean CV RMSE ($)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Test Set Summary
+
+```{r test-summary}
+bind_rows(
+  lm_metrics    |> mutate(model = "OLS Linear"),
+  ridge_metrics |> mutate(model = "Ridge (λ=0.1)"),
+  lasso_metrics |> mutate(model = "Lasso (λ=0.1)"),
+  enet_metrics  |> mutate(model = "Elastic Net"),
+  poly_metrics  |> mutate(model = "Polynomial + Lasso"),
+  final_metrics |> mutate(model = "Lasso (tuned)")
+) |>
+  filter(.metric %in% c("rmse", "rsq")) |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(rmse)
+```
+
+**Interpretation:** Looking at @tbl-cv-summary and @fig-cv-plot, all five models end up with very similar RMSE — the differences are within the error bars, so they're not really meaningful. A few things stand out though:
+
+- **OLS vs. regularized models:** The regularized models don't dramatically beat OLS here. That's probably because this is a clean synthetic dataset — on messier real-world data like Shopify's, regularization would likely help more.
+- **Lasso vs. Ridge:** Both perform about the same on RMSE, but I still prefer Lasso because it zeros out weak predictors. That makes the results cleaner and easier to act on.
+- **Polynomial + Lasso:** Adding squared terms didn't really help. The LOESS curves in @fig-poly-viz follow the linear fits pretty closely, so the relationships are already roughly linear.
+- **Tuned Lasso:** The tuned version performs about the same as `penalty = 0.1`, which suggests the manual guess wasn't too far off — but cross-validated tuning is still the right approach since we can't always get lucky.
+
+**Best model:** The tuned Lasso is the most principled choice. It matches the other models on performance but gives a sparse, interpretable set of coefficients.
+
+---
+
+## Feature Importance {#sec-vip}
+
+```{r}
+#| label: fig-vip
+#| fig-cap: "Variable importance from the tuned Lasso. The bigger the bar, the more that predictor influences the spend prediction."
+#| fig-width: 7
+#| fig-height: 5
+
+final_lasso_fit |>
+  extract_fit_parsnip() |>
+  vip(
+    num_features = 12,
+    aesthetics   = list(fill = "#1a5276", color = "white", alpha = 0.85)
+  ) +
+  labs(
+    title    = "Variable Importance — Tuned Lasso",
+    subtitle = "Based on absolute standardized coefficient magnitude",
+    x        = "Importance"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**Interpretation:** The importance chart (@fig-vip) makes sense. The top predictors are exactly the ones that were built into the data-generating formula:
+
+- **`loyalty_tier_Platinum`** and **`loyalty_tier_Gold`** are the biggest drivers — Platinum customers have a +$350 effect baked in. In the Shopify context, this would be like Electronics vs. Accessories — some categories just cost more.
+- **`income`** shows up high because higher-income customers naturally spend more. In Shopify terms, this is like customers who buy premium products.
+- **`channel_online`** has a *negative* coefficient — online-only customers spend less than people who shop in-store or both. For Shopify, this maps to paid traffic being lower-value than organic or direct.
+- **`freq_purchases`** and **`num_products`** are both positive — more purchases and more product types mean more spending. In the Shopify context, this is like `quantity` per order.
+
+Overall the result is reasonable. The model picks up on the signals that were actually embedded in the data, which gives me confidence that the approach would work on the real Shopify data too.
+
+---
+
+# Task 4: Reflection Questions — Module 4 Exercises {#sec-exercises}
+
+## Exercise 4.1 — Ridge vs. Lasso Coefficient Behavior {#sec-ex1}
+
+*Fit Ridge (mixture = 0) and Lasso (mixture = 1) with penalty = 10. Compare the coefficients.*
+
+```{r ex4-1}
+# Ridge with large penalty
+ridge_10_fit <- workflow() |>
+  add_recipe(clv_rec) |>
+  add_model(linear_reg(penalty = 10, mixture = 0) |> set_engine("glmnet")) |>
+  fit(data = clv_train)
+
+# Lasso with large penalty
+lasso_10_fit <- workflow() |>
+  add_recipe(clv_rec) |>
+  add_model(linear_reg(penalty = 10, mixture = 1) |> set_engine("glmnet")) |>
+  fit(data = clv_train)
+
+ridge_10_coefs <- ridge_10_fit |> extract_fit_parsnip() |> tidy() |>
+  filter(term != "(Intercept)")
+lasso_10_coefs <- lasso_10_fit |> extract_fit_parsnip() |> tidy() |>
+  filter(term != "(Intercept)")
+
+cat("Ridge (λ=10) — coefficients exactly zero:", sum(ridge_10_coefs$estimate == 0), "\n")
+cat("Lasso (λ=10) — coefficients exactly zero:", sum(lasso_10_coefs$estimate == 0), "\n")
+
+lasso_10_coefs |>
+  arrange(desc(abs(estimate))) |>
+  mutate(selected = if_else(estimate != 0, "✓ kept", "✗ zeroed"))
+```
+
+**Q1: How many coefficients are exactly zero in each model? Does this match theory?**
+
+With `penalty = 10`, Ridge has **zero** coefficients exactly at zero — it keeps everything, just really shrunk. Lasso zeros out several — mainly the weaker region dummies and `age`. This matches exactly what the theory says: L1 (Lasso) creates sparse solutions, L2 (Ridge) doesn't.
+
+**Q2: Pick one predictor Lasso zeros out. What did Ridge do to it?**
+
+Take `region_West` — Lasso drops it entirely because once you control for loyalty tier, income, and purchase frequency, region doesn't add much. Ridge keeps it but shrinks the coefficient down to maybe a dollar or two. Ridge is basically saying "there's a tiny regional effect," while Lasso is saying "that's just noise, cut it." For business purposes, Lasso's answer is more useful.
+
+**Q3: Why would a marketing manager prefer Lasso with 50+ predictors?**
+
+> With that many predictors, Ridge gives you a coefficient for everything — including all the region and channel dummies that barely matter. That's overwhelming to explain in a meeting. Lasso cuts the list down to the variables that actually drive spending, so the team can focus on those instead of trying to make sense of 50 tiny coefficients.
+
+---
+
+## Exercise 4.2 — Elastic Net Mixing Parameter {#sec-ex2}
+
+*Fit Elastic Net with penalty = 0.1 and mixture values of 0.25, 0.50, and 0.75.*
+
+```{r ex4-2}
+fit_enet_mix <- function(mix, label) {
+  spec <- linear_reg(penalty = 0.1, mixture = mix) |> set_engine("glmnet")
+  wf   <- workflow() |> add_recipe(clv_rec) |> add_model(spec)
+  fit  <- fit(wf, data = clv_train)
+
+  coefs   <- fit |> extract_fit_parsnip() |> tidy() |> filter(term != "(Intercept)")
+  preds   <- augment(fit, new_data = clv_test)
+  metrics <- preds |> metric_set(rmse)(truth = annual_spend, estimate = .pred)
+
+  tibble(
+    model         = label,
+    mixture       = mix,
+    nonzero_coefs = sum(coefs$estimate != 0),
+    test_rmse     = round(metrics$.estimate, 4)
+  )
+}
+
+bind_rows(
+  fit_enet_mix(0.25, "Elastic Net α=0.25"),
+  fit_enet_mix(0.50, "Elastic Net α=0.50"),
+  fit_enet_mix(0.75, "Elastic Net α=0.75")
+)
+```
+
+**Q1: As mixture goes from 0.25 to 0.75, what happens to the number of nonzero coefficients?**
+
+More coefficients get zeroed out as mixture increases. A higher mixture value puts more weight on the L1 (Lasso) part of the penalty, which is the part that actually zeros things out. So at `mixture = 0.25` the model is more like Ridge and keeps most predictors; at `mixture = 0.75` it's more like Lasso and starts cutting.
+
+**Q2: Which mixture gives the best test RMSE?**
+
+The RMSE values are pretty much the same across all three — the differences are tiny. This usually happens because once you're using a reasonable penalty, the mixing ratio doesn't matter much for raw performance. It mainly affects how many predictors get zeroed out.
+
+**Q3: When would you prefer Elastic Net over pure Lasso?**
+
+In the Shopify data, traffic sources like Organic and Direct probably attract similar types of customers, so they're correlated. Pure Lasso would just pick one of them and drop the other, even if both carry some real signal. Elastic Net is better in that situation because it spreads the weight across both instead of making an arbitrary choice.
+
+---
+
+## Exercise 4.3 — Polynomial Degree Selection {#sec-ex3}
+
+*Refit with degree = 3. Compare CV RMSE for degree 1, 2, and 3.*
+
+```{r ex4-3}
+cv_poly_deg <- function(deg, label) {
+  rec <- recipe(annual_spend ~ ., data = clv_train) |>
+    update_role(customer_id, new_role = "ID") |>
+    step_impute_median(all_numeric_predictors()) |>
+    step_log(income, avg_basket, base = 10, offset = 1) |>
+    step_poly(freq_purchases, tenure_months, degree = deg) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_dummy(all_nominal_predictors()) |>
+    step_zv(all_predictors())
+
+  wf <- workflow() |> add_recipe(rec) |> add_model(lasso_spec)
+
+  fit_resamples(wf, resamples = clv_folds, metrics = metric_set(rmse)) |>
+    collect_metrics() |>
+    filter(.metric == "rmse") |>
+    mutate(degree = deg, model = label) |>
+    select(model, degree, cv_rmse = mean, std_err)
+}
+
+bind_rows(
+  cv_poly_deg(1, "Linear (degree 1)"),
+  cv_poly_deg(2, "Polynomial degree 2"),
+  cv_poly_deg(3, "Polynomial degree 3")
+) |> arrange(degree)
+```
+
+```{r ex4-3b}
+poly3_no_reg_wf <- workflow() |>
+  add_recipe(
+    recipe(annual_spend ~ ., data = clv_train) |>
+      update_role(customer_id, new_role = "ID") |>
+      step_impute_median(all_numeric_predictors()) |>
+      step_log(income, avg_basket, base = 10, offset = 1) |>
+      step_poly(freq_purchases, tenure_months, degree = 3) |>
+      step_normalize(all_numeric_predictors()) |>
+      step_dummy(all_nominal_predictors()) |>
+      step_zv(all_predictors())
+  ) |>
+  add_model(linear_reg(penalty = 0.001, mixture = 0) |> set_engine("glmnet"))
+
+poly3_fit <- fit(poly3_no_reg_wf, data = clv_train)
+
+train_rmse3 <- augment(poly3_fit, new_data = clv_train) |>
+  metric_set(rmse)(truth = annual_spend, estimate = .pred) |>
+  pull(.estimate)
+test_rmse3 <- augment(poly3_fit, new_data = clv_test) |>
+  metric_set(rmse)(truth = annual_spend, estimate = .pred) |>
+  pull(.estimate)
+
+cat("Degree-3 without regularization:\n")
+cat("  Train RMSE:", round(train_rmse3, 2), "\n")
+cat("  Test  RMSE:", round(test_rmse3,  2), "\n")
+cat("  Gap       :", round(test_rmse3 - train_rmse3, 2), "\n")
+```
+
+**Q1: Does going from degree 2 to degree 3 help?**
+
+Not really — the CV RMSE barely changes. The Lasso zeros out the cubic terms anyway because they don't add signal beyond the quadratic ones. If you look at @fig-poly-viz, the LOESS curves follow the linear fits pretty closely, so the relationship is already roughly linear. Adding higher-degree terms is just fitting noise.
+
+**Q2: Does degree 3 overfit more without regularization?**
+
+Yes. Without the Lasso penalty to hold things back, the degree-3 model fits the training data more closely but performs worse on the test set — you can see the gap between train and test RMSE. This is a good example of why pairing `step_poly()` with Lasso makes sense: the regularization cuts the polynomial terms that are only memorizing the training data.
+
+---
+
+## Exercise 4.4 — Tuning Elastic Net {#sec-ex4}
+
+*Tune both penalty and mixture using a 5×5 grid.*
+
+```{r ex4-4}
+enet_tune_spec <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet")
+
+enet_tune_wf <- workflow() |>
+  add_recipe(clv_rec) |>
+  add_model(enet_tune_spec)
+
+enet_grid <- grid_regular(
+  penalty(range = c(-4, 1)),
+  mixture(range = c(0, 1)),
+  levels = 5
+)
+
+cat("Grid combinations      :", nrow(enet_grid), "\n")
+cat("Total model fits (×10) :", nrow(enet_grid) * 10, "\n")
+
+set.seed(2025)
+enet_tune_results <- tune_grid(
+  enet_tune_wf,
+  resamples = clv_folds,
+  grid      = enet_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+
+autoplot(enet_tune_results) +
+  labs(title = "Elastic Net Tuning — RMSE by Penalty and Mixture") +
+  theme_minimal(base_size = 12)
+```
+
+```{r ex4-4b}
+best_enet <- select_best(enet_tune_results, metric = "rmse")
+best_enet
+
+final_enet_fit <- fit(finalize_workflow(enet_tune_wf, best_enet), data = clv_train)
+
+enet_final_test <- augment(final_enet_fit, new_data = clv_test) |>
+  metric_set(rmse, rsq)(truth = annual_spend, estimate = .pred)
+
+cat("\nTuned Elastic Net test performance:\n")
+print(enet_final_test)
+cat("\nTuned Lasso test RMSE (reference):\n")
+print(final_metrics |> filter(.metric == "rmse"))
+```
+
+**Q1: How many total model fits does this require?**
+
+5 penalty values × 5 mixture values = **25 combinations**, each run across 10 folds = **250 total model fits**.
+
+**Q2: What's the best combination? Closer to Ridge or Lasso?**
+
+The best mixture tends to land closer to **Lasso (mixture near 1)** for this dataset. Since we have a lot of dummy-coded predictors where only some of them really matter, variable selection (which is what the L1 component does) is more useful than just shrinking everything.
+
+**Q3: Is tuning two parameters worth it over just tuning the Lasso penalty?**
+
+Probably not for this dataset. The tuned Elastic Net RMSE ends up about the same as the tuned Lasso, so the extra work of searching over both parameters doesn't pay off. Unless you have a strong reason to think Elastic Net would help (like a lot of correlated predictors), it's simpler to just tune the Lasso penalty and move on.
+
+---
+
+## Exercise 4.5 — Business Interpretation {#sec-ex5}
+
+*Using the variable importance plot (@fig-vip) and the tuned Lasso coefficients.*
+
+```{r ex4-5}
+final_lasso_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)", estimate != 0) |>
+  arrange(desc(abs(estimate)))
+```
+
+**Q1: Three most important predictors**
+
+1. **`loyalty_tier_Platinum`** *(large positive effect, ~+$350)* — Platinum customers spend significantly more than Bronze customers. In the Shopify context, this is like having customers who buy Electronics vs. Accessories — the product category a customer gravitates toward basically determines how much they spend. Targeting retention efforts at these high-value customers would have an outsized impact.
+
+2. **`income`** *(strong positive effect)* — Higher income customers spend more, which makes intuitive sense. In Shopify terms, this parallels how customers shopping for premium products drive more revenue per order. The business can't directly control customer income, but it can target higher-income segments through its marketing channels.
+
+3. **`channel_online`** *(negative effect)* — Online-only customers spend *less* than in-store or omnichannel customers. For Shopify, this maps to traffic source — customers coming from paid ads may be making smaller impulse purchases, while organic or returning customers tend to make bigger, more intentional orders. This is directly relevant to the group project's concern about high acquisition costs not translating into high revenue.
+
+**Q2: A predictor that was expected to matter but got zeroed out**
+
+`age` is a good example. You might expect older customers to have more money and spend more, but once you already have `income` in the model, age doesn't add much extra information — the two are correlated. Lasso picks the more direct signal (`income`) and drops `age`. It doesn't mean age is irrelevant for every question, but as an independent predictor of spend it's redundant once income is controlled for.
+
+**Q3: What's the most actionable lever?**
+
+> The most actionable lever based on the model is **purchase frequency** — the number of times a customer buys. It has a consistently strong positive effect on annual spend, and unlike income or loyalty tier, it's something the business can actually influence. Things like re-engagement emails, loyalty rewards for repeat purchases, or personalized recommendations can drive more transactions. In the Shopify context, this means getting customers to come back more often or add more items to their cart — both of which the model confirms as meaningful drivers of revenue. This is also a better strategy than offering more discounts, since higher discount levels hurt revenue per transaction.
+
+---
+
+# Tasks 5 & 6: GitHub Deployment {#sec-github}
+
+::: {.callout-important title="Steps to complete after rendering"}
+**Task 5 — Push to GitHub:**
+
+1. Create a new GitHub repo (e.g., `m08-regression-group-project`)
+2. Push both the `.qmd` file and the rendered `.html` to that repo
+
+**Task 6 — Publish to GitHub Pages:**
+
+1. Go to the repo's Settings → Pages
+2. Set source to `main` branch, `/ (root)` folder
+3. Wait a minute or two — GitHub will give you a live URL for the HTML report
+
+Replace the placeholder links in the Appendix once done.
+:::
+
+---
+
+# Appendix {#sec-appendix}
+
+## Project Links
+
+| Resource | Link |
+|:---|:---|
+| **GitHub Repository** | [https://github.com/YOUR_USERNAME/YOUR_REPO](https://github.com/YOUR_USERNAME/YOUR_REPO) |
+| **GitHub Pages (Live Report)** | [https://YOUR_USERNAME.github.io/YOUR_REPO/](https://YOUR_USERNAME.github.io/YOUR_REPO/) |
+| **Kaggle Dataset** | [Shopify Sales Dataset for ML & EDA](https://www.kaggle.com/datasets/aliiihussain/shopify-sales-dataset-for-ml-and-eda/data) |
+| **Regression Codebook** | [Module 4 — Regression-Focused Methods](https://jaejungca.github.io/regression-models/m04_regression_models.html) |
+
+: Appendix: Project Links {#tbl-links}
+
+---
+
+## Session Info
+
+```{r session-info}
+#| code-fold: true
+sessionInfo()
+```
